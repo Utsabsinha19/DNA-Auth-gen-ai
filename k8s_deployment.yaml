@@ -1,0 +1,118 @@
+# GenAuth AI — Kubernetes Deployment
+# Requires: kubectl, NVIDIA device plugin, cert-manager
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: face-service
+  namespace: genauth
+  labels:
+    app: face-service
+    version: v3.1.0
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: face-service
+  template:
+    metadata:
+      labels:
+        app: face-service
+    spec:
+      containers:
+        - name: face-service
+          image: genauth/face-service:3.1.0
+          ports:
+            - containerPort: 8002
+          resources:
+            requests: { cpu: "2", memory: "4Gi" }
+            limits:
+              cpu: "4"
+              memory: "8Gi"
+              nvidia.com/gpu: "1"
+          env:
+            - name: USE_GPU
+              value: "true"
+            - name: MODEL_PATH
+              value: /models/arcface_r100.onnx
+          volumeMounts:
+            - name: model-cache
+              mountPath: /models
+          readinessProbe:
+            httpGet: { path: /health, port: 8002 }
+            initialDelaySeconds: 15
+            periodSeconds: 10
+          livenessProbe:
+            httpGet: { path: /health, port: 8002 }
+            initialDelaySeconds: 30
+            periodSeconds: 30
+      volumes:
+        - name: model-cache
+          persistentVolumeClaim:
+            claimName: model-cache-pvc
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: face-service
+  namespace: genauth
+spec:
+  selector:
+    app: face-service
+  ports:
+    - port: 8002
+      targetPort: 8002
+  type: ClusterIP
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: dna-service
+  namespace: genauth
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: dna-service
+  template:
+    metadata:
+      labels:
+        app: dna-service
+    spec:
+      containers:
+        - name: dna-service
+          image: genauth/dna-service:3.1.0
+          ports:
+            - containerPort: 8003
+          resources:
+            requests: { cpu: "1", memory: "2Gi" }
+            limits: { cpu: "2", memory: "4Gi" }
+          readinessProbe:
+            httpGet: { path: /health, port: 8003 }
+            initialDelaySeconds: 10
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: face-service-hpa
+  namespace: genauth
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: face-service
+  minReplicas: 2
+  maxReplicas: 20
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70
+    - type: Resource
+      resource:
+        name: memory
+        target:
+          type: Utilization
+          averageUtilization: 80

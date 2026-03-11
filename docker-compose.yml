@@ -1,0 +1,162 @@
+version: "3.9"
+
+# ─── GenAuth AI — Docker Compose Stack ───────────────────────────────────────
+# Services: auth | face | dna | ai_gen | gateway | postgres | redis | kafka
+
+x-logging: &logging
+  logging:
+    driver: "json-file"
+    options: { max-size: "50m", max-file: "3" }
+
+services:
+  # ── API Gateway (Node.js + Nginx) ──────────────────────────────────────────
+  gateway:
+    build:
+      context: ../../backend/gateway
+      dockerfile: Dockerfile
+    ports:
+      - "8080:8080"
+    environment:
+      AUTH_SVC_URL: http://auth_service:8001
+      FACE_SVC_URL: http://face_service:8002
+      DNA_SVC_URL: http://dna_service:8003
+      AI_SVC_URL: http://ai_service:8004
+      JWT_SECRET: ${JWT_SECRET:-change-me-in-production}
+      RATE_LIMIT_RPM: 1000
+    depends_on: [auth_service, face_service, dna_service, ai_service]
+    networks: [genauth]
+    <<: *logging
+
+  # ── Auth Orchestrator ──────────────────────────────────────────────────────
+  auth_service:
+    build:
+      context: ../../backend/auth_service
+      dockerfile: Dockerfile
+    environment:
+      FACE_SVC_URL: http://face_service:8002
+      DNA_SVC_URL: http://dna_service:8003
+      REDIS_URL: redis://redis:6379
+      DB_URL: postgresql://genauth:${DB_PASSWORD:-genauth}@postgres:5432/genauth
+      SECRET_KEY: ${SECRET_KEY:-change-me}
+    depends_on: [postgres, redis]
+    networks: [genauth]
+    <<: *logging
+
+  # ── Face Recognition ───────────────────────────────────────────────────────
+  face_service:
+    build:
+      context: ../../backend/face_service
+      dockerfile: Dockerfile
+    environment:
+      MODEL_PATH: /models/arcface_r100.onnx
+      USE_GPU: "true"
+      GPU_ID: "0"
+    volumes:
+      - model_cache:/models
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    networks: [genauth]
+    <<: *logging
+
+  # ── DNA Processing ─────────────────────────────────────────────────────────
+  dna_service:
+    build:
+      context: ../../backend/dna_service
+      dockerfile: Dockerfile
+    environment:
+      WORKERS: "2"
+    networks: [genauth]
+    <<: *logging
+
+  # ── AI Generation ──────────────────────────────────────────────────────────
+  ai_service:
+    build:
+      context: ../../backend/ai_service
+      dockerfile: Dockerfile
+    environment:
+      SD_MODEL: runwayml/stable-diffusion-v1-5
+      USE_GPU: "true"
+      OFFLOAD_CPU: "false"
+    volumes:
+      - model_cache:/models
+      - huggingface_cache:/root/.cache/huggingface
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    networks: [genauth]
+    <<: *logging
+
+  # ── PostgreSQL (Identity + Auth Logs) ─────────────────────────────────────
+  postgres:
+    image: pgvector/pgvector:pg16
+    environment:
+      POSTGRES_DB: genauth
+      POSTGRES_USER: genauth
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-genauth}
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+      - ./init.sql:/docker-entrypoint-initdb.d/init.sql
+    ports:
+      - "5432:5432"
+    networks: [genauth]
+    <<: *logging
+
+  # ── Redis (Sessions + Cache) ──────────────────────────────────────────────
+  redis:
+    image: redis:7-alpine
+    command: redis-server --maxmemory 2gb --maxmemory-policy allkeys-lru
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    networks: [genauth]
+
+  # ── Kafka (Audit Events) ──────────────────────────────────────────────────
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.4.0
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+    networks: [genauth]
+
+  kafka:
+    image: confluentinc/cp-kafka:7.4.0
+    depends_on: [zookeeper]
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+    ports:
+      - "9092:9092"
+    networks: [genauth]
+
+  # ── Frontend ──────────────────────────────────────────────────────────────
+  frontend:
+    build:
+      context: ../../frontend
+      dockerfile: Dockerfile
+    ports:
+      - "3000:3000"
+    environment:
+      NEXT_PUBLIC_API_URL: http://localhost:8080
+    depends_on: [gateway]
+    networks: [genauth]
+
+networks:
+  genauth:
+    driver: bridge
+
+volumes:
+  pg_data:
+  redis_data:
+  model_cache:
+  huggingface_cache:
